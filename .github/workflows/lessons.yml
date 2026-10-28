@@ -33,8 +33,11 @@ name: New lessons — Rav Meir Eliyahu / every teacher of the site / Kabbalah
 run-name: ${{ (github.event.schedule == '47 18 * * *' || inputs.set == 'kabbalah') && 'Kabbalah channels' || 'Site teachers' }}
 # 2026-10-27: moved from emunah-caption-harvest (emunah-pipeline/lessons) to the organization emunah-pipeline, whose
 # 20 concurrent jobs are its own (the owner: "free up new lanes"); the dubs and translations stay in the harvest.
-# The schedules come back here once the secrets are set and a test run passed.
+# The daily schedules live here since 2026-10-27 (moved from emunah-caption-harvest after a passing test run).
 on:
+  schedule:
+    - cron: '17 6 * * *'
+    - cron: '47 18 * * *'
   workflow_dispatch:
     inputs:
       ids:
