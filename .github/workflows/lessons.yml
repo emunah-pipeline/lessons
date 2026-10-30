@@ -62,6 +62,10 @@ on:
         type: choice
         options: [site, kabbalah]
         default: site
+      chain:
+        description: 'Start the next run of this set when this one curated its lessons (2026-10-30)'
+        type: boolean
+        default: false
 # one run of each set at a time (2026-10-27: the Kabbalah set runs beside the site's, the owner: "add new lanes");
 # their finish jobs take turns (the same files in three repos)
 concurrency:
@@ -69,6 +73,7 @@ concurrency:
   cancel-in-progress: false
 permissions:
   contents: write
+  actions: write
 env:
   OWNER: crispinekkovendas-blip
   SET: ${{ (github.event.schedule == '47 18 * * *' || inputs.set == 'kabbalah') && 'kabbalah' || 'site' }}
@@ -360,3 +365,18 @@ jobs:
           (cd book && git add data/shiurim.json && (git diff --cached --quiet || (git commit -q -m "$msg" && push)))
           (cd shiur && git add src/data/catalog.json public/estudo scripts/out/dates.json && (git diff --cached --quiet || (git commit -q -m "$msg" && push)))
           echo "committed — deploy when ready: deploy-site.ps1 (Shiur Hebraico) and npm run deploy (Emunah Shlemah)"
+      # 2026-10-30 (the owner: "we need to get all the juice of the limit we have"): with chain on, a run
+      # that curated at least half of its lessons starts the next ones of its set; a run stopped by the
+      # Claude limit (most curate jobs failed) ends the chain and the daily schedule starts it again
+      - name: Keep the chain going
+        if: (inputs.chain || (github.event_name == 'schedule' && env.SET == 'kabbalah')) && needs.curate.result != 'cancelled'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          read ok all < <(gh api "repos/$GITHUB_REPOSITORY/actions/runs/${{ github.run_id }}/jobs?per_page=100" --paginate             -q '.jobs[] | select(.name | startswith("curate")) | .conclusion' | awk '{a++} $1=="success"{o++} END{print o+0, a+0}')
+          echo "curated $ok of $all"
+          if [ "$all" -gt 0 ] && [ $((ok * 2)) -ge "$all" ]; then
+            gh workflow run lessons.yml --repo "$GITHUB_REPOSITORY" --ref "${{ github.ref_name }}" -f set="$SET" -f max="${{ inputs.max || '30' }}" -f chain=true
+          else
+            echo "chain stopped (the Claude limit?) — the daily schedule starts it again"
+          fi
