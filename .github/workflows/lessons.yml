@@ -69,7 +69,9 @@ on:
 # one run of each set at a time (2026-10-27: the Kabbalah set runs beside the site's, the owner: "add new lanes");
 # their finish jobs take turns (the same files in three repos)
 concurrency:
-  group: meir-new-${{ (github.event.schedule == '47 18 * * *' || inputs.set == 'kabbalah') && 'kabbalah' || 'site' }}
+# runs given ids (-f ids=…) wait in their own line (2026-11-07): behind a 30-lesson run they waited for hours, and that
+# run's chain dispatch replaced them in the pending slot
+  group: meir-new-${{ inputs.ids != '' && 'ids' || ((github.event.schedule == '47 18 * * *' || inputs.set == 'kabbalah') && 'kabbalah' || 'site') }}
   cancel-in-progress: false
 permissions:
   contents: write
