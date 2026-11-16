@@ -174,10 +174,25 @@ jobs:
             ~/.cache/pip
             ~/.cache/torch
           key: stt-whisperx-ivrit-v1
-      - name: Install
+      - id: install
+        name: Install
+        # 2026-11-16: on 2026-11-11 Ubuntu's package mirror was down and 44 jobs waited about an hour each before
+        # failing. Now three tries of at most 4 minutes each, and a failure here gives the lesson its try back.
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg >/dev/null
-          python -m pip install --quiet whisperx "yt-dlp[default]" curl-cffi
+          apt() { sudo timeout 240 apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 "$@"; }
+          if ! command -v ffmpeg > /dev/null; then
+            ok=0
+            for i in 1 2 3; do
+              if apt update -qq && apt install -y -qq ffmpeg > /dev/null; then ok=1; break; fi
+              echo "::warning::ffmpeg install, try $i of 3 failed"; sleep $((i * 20))
+            done
+            [ "$ok" = 1 ] || { echo "::error::ffmpeg could not be installed"; exit 1; }
+          fi
+          for i in 1 2 3; do
+            python -m pip install --quiet whisperx "yt-dlp[default]" curl-cffi && break
+            [ "$i" = 3 ] && { echo "::error::the Python packages could not be installed"; exit 1; }
+            sleep $((i * 20))
+          done
       - name: Cookies
         env:
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
@@ -185,15 +200,43 @@ jobs:
         run: |
           printf '%s\n' "$YT_COOKIES" > "$RUNNER_TEMP/cookies.txt"
           head -1 "$RUNNER_TEMP/cookies.txt" | grep -q '^# Netscape' || sed -i '1i # Netscape HTTP Cookie File' "$RUNNER_TEMP/cookies.txt"
-      - name: Audio
+      - id: audio
+        name: Audio
         env:
           YT_COOKIES_FILE: ${{ runner.temp }}/cookies.txt
         run: python -u site/pipeline/meir_new.py audio --ids=${{ matrix.id }} --dir audio
-      - name: Transcribe
+      - id: stt
+        name: Transcribe
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-        run: python -u scripts/transcribe.py --ids=${{ matrix.id }} --audio-dir audio --budget-min 280
+        # exit code 75 = Supabase did not answer after five tries (scripts/transcribe.py): not the lesson's failure
+        run: |
+          code=0
+          python -u scripts/transcribe.py --ids=${{ matrix.id }} --audio-dir audio --budget-min 280 || code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+      # 2026-11-16 (the owner: "yes do the curation and transcription fixes too"): one word about this lesson for the
+      # finish job (site pipeline/settle_tries.py). A try counts only when WhisperX really ran: by 2026-11-15, 49 lessons
+      # had left the queue after three tries, almost all used up by failures that were not theirs.
+      - name: What happened to this lesson
+        if: always()
+        run: |
+          if [ "${{ steps.install.outcome }}" != success ]; then o=install
+          elif [ "${{ steps.audio.outcome }}" != success ]; then o=audio
+          elif [ "${{ steps.stt.outputs.code }}" = 75 ]; then o=supabase
+          elif [ "${{ steps.stt.outcome }}" != success ]; then o=whisper
+          else o=ok; fi
+          mkdir -p outcome
+          echo "$o" > "outcome/${{ matrix.id }}.stt"
+          echo "${{ matrix.id }}: $o"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: outcome-stt-${{ matrix.id }}
+          overwrite: true
+          path: outcome/
+          if-no-files-found: ignore
 
   curate:
     needs: [find, stt]
@@ -235,9 +278,16 @@ jobs:
           ID: ${{ matrix.id }}
         run: |
           TS="node --experimental-transform-types --import ./scripts/ts-hook.mjs"
-          $TS scripts/curate-export.mjs --ids "$ID" 2>&1 | grep -v Experimental | tail -2 || true
+          # 2026-11-16: one word about this lesson for the finish job (pipeline/settle_tries.py: a try counts only when
+          # Claude really replied), and every reply the check turns down is kept as a run file (kept/ → the artifact
+          # rejected-<id>) — until now a rejected reply was thrown away and nobody could see why it failed
+          mkdir -p "$GITHUB_WORKSPACE/outcome" "$GITHUB_WORKSPACE/kept"
+          say() { echo "$1" > "$GITHUB_WORKSPACE/outcome/$ID.curate"; }
+          if $TS scripts/curate-export.mjs --ids "$ID" > export.log 2>&1; then say notranscript; else say supabase; echo "::warning::$ID: the transcript could not be read"; fi
+          grep -v Experimental export.log | tail -2 || true
           IN=".curate/in/$ID.txt"
           if [ ! -s "$IN" ]; then echo "::warning::$ID has no transcript to curate (or is curated already)"; exit 0; fi
+          say noreply
           mkdir -p .curate/out
           # ONE SHOT, like translate-batch.yml: the work file on stdin, the rules as the system prompt, no tools;
           # a second try when the check rejects the first
@@ -256,12 +306,30 @@ jobs:
               console.log(`reply: ${t.length} characters${j.is_error ? " · error: " + String(j.result).slice(0, 160) : ""} · tokens in ${j.usage?.input_tokens ?? "?"} + cache ${j.usage?.cache_read_input_tokens ?? 0}, out ${j.usage?.output_tokens ?? "?"}`)
             ' ".curate/out/$ID.txt"
             if [ ! -s ".curate/out/$ID.txt" ]; then grep -ihE "limit|rate|quota|error|login" usage.json err.txt | head -5 || true; continue; fi
+            say rejected
+            cp ".curate/out/$ID.txt" "$GITHUB_WORKSPACE/kept/$ID.try$attempt.txt"
             $TS scripts/curate-upload.mjs 2>&1 | grep -vE "Experimental|trace-warnings" | tail -4 || true
-            if [ -f ".curate/done/$ID.txt" ]; then echo "curated $ID"; exit 0; fi
-            echo "rejected:"; cat .curate/rejected/$ID.* 2>/dev/null | tail -5 || true
+            if [ -f ".curate/done/$ID.txt" ]; then say curated; rm -f "$GITHUB_WORKSPACE/kept/$ID.try$attempt.txt"; echo "curated $ID"; exit 0; fi
+            cp ".curate/rejected/$ID.reason" "$GITHUB_WORKSPACE/kept/$ID.try$attempt.reason" 2>/dev/null || true
+            echo "rejected: $(cat ".curate/rejected/$ID.reason" 2>/dev/null)"
           done
           echo "::error::$ID not curated"
           exit 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: outcome-curate-${{ matrix.id }}
+          overwrite: true
+          path: outcome/
+          if-no-files-found: ignore
+      - name: Keep the rejected replies
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rejected-${{ matrix.id }}
+          overwrite: true
+          path: kept/
+          if-no-files-found: ignore
 
   finish:
     needs: [find, curate]
@@ -298,6 +366,26 @@ jobs:
         with:
           name: found
           path: found
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: outcome-*
+          merge-multiple: true
+          path: outcome
+      # 2026-11-16: meir_new.py find counts a try when it hands a lesson out, and three tries end a lesson's stay in
+      # the queue. A try now counts only when WhisperX or Claude really worked on the lesson: every other failure
+      # (install, Supabase, no reply from Claude, YouTube refusing most of the run) gets it back here, first of all,
+      # so a failure further down this job cannot skip it.
+      - name: Give back the tries that were not the lesson's
+        if: always() && inputs.ids == ''
+        working-directory: site
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/outcome"
+          python pipeline/settle_tries.py --set "$SET" --ids "$GITHUB_WORKSPACE/found/new.json" --outcomes "$GITHUB_WORKSPACE/outcome"
+          git config user.name "emunah-pipeline"
+          git config user.email "actions@github.com"
+          for p in pipeline/sweep-queue.json pipeline/kabbalah-queue.json; do [ ! -e "$p" ] || git add "$p"; done
+          git diff --cached --quiet || (git commit -q -m "pipeline: tries given back to the lessons whose failure was not theirs ($SET, emunah-pipeline/lessons run ${{ github.run_id }})" && for i in 1 2 3 4 5; do git pull --rebase -q && git push -q && break; sleep $((RANDOM % 10 + 5)); done)
       - name: Keys for the sites' scripts
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -375,10 +463,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          read ok all < <(gh api "repos/$GITHUB_REPOSITORY/actions/runs/${{ github.run_id }}/jobs?per_page=100" --paginate             -q '.jobs[] | select(.name | startswith("curate")) | .conclusion' | awk '{a++} $1=="success"{o++} END{print o+0, a+0}')
-          echo "curated $ok of $all"
-          if [ "$all" -gt 0 ] && [ $((ok * 2)) -ge "$all" ]; then
+          # 2026-11-16: counted from what each curate job really did, not from its green tick — a lesson with no
+          # transcript ended its job in "success" with nothing done, so a run in which every transcription failed
+          # still started the next one. The chain goes on when at least one lesson was curated and Claude answered
+          # more than half of the lessons it was asked; it stops when Claude mostly did not answer (the limit).
+          n() { grep -lx "$1" outcome/*.curate 2> /dev/null | wc -l; }
+          ok=$(n curated); rejected=$(n rejected); noreply=$(n noreply)
+          asked=$((ok + rejected + noreply))
+          echo "curated $ok · rejected $rejected · no reply from Claude $noreply · of ${{ needs.find.outputs.csv }}" | cut -c1-200
+          if [ "$ok" -gt 0 ] && [ $((noreply * 2)) -lt "$asked" ]; then
             gh workflow run lessons.yml --repo "$GITHUB_REPOSITORY" --ref "${{ github.ref_name }}" -f set="$SET" -f max="${{ inputs.max || '30' }}" -f all="${{ inputs.all || github.event_name == 'schedule' }}" -f chain=true
           else
-            echo "chain stopped (the Claude limit?) — the daily schedule starts it again"
+            echo "chain stopped (nothing curated, or the Claude limit) — the daily schedule starts it again"
           fi

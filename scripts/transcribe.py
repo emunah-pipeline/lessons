@@ -26,8 +26,10 @@ import glob
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -43,10 +45,34 @@ LANGS = {
 }
 
 
+class SupabaseDown(Exception):
+    """Supabase did not answer after every try — not the lesson's failure (exit code 75, see __main__)"""
+
+
+def supa(req, tries=5):
+    """
+    A Supabase call, tried again after a gateway error or a timeout. 2026-11-16: on 2026-11-08, 90 jobs stopped at
+    their first step, the "already transcribed?" read, on one 504 with no retry — and each lost one of its three tries.
+    """
+    for n in range(1, tries + 1):
+        try:
+            return urllib.request.urlopen(req, timeout=60).read()
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                raise
+            why = f'HTTP {e.code}'
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            why = str(e)
+        if n == tries:
+            raise SupabaseDown(why)
+        print(f'Supabase: {why} — try {n} of {tries}, waiting {10 * n}s', flush=True)
+        time.sleep(10 * n)
+
+
 def kv_has(key):
     q = urllib.parse.quote(key, safe='')
     req = urllib.request.Request(f'{SUPA}/rest/v1/global_options?select=key&key=eq.{q}', headers=H)
-    return bool(json.load(urllib.request.urlopen(req, timeout=60)))
+    return bool(json.loads(supa(req)))
 
 
 def kv_put(key, value):
@@ -55,7 +81,7 @@ def kv_put(key, value):
         f'{SUPA}/rest/v1/global_options?on_conflict=key', data=body, method='POST',
         headers={**H, 'content-type': 'application/json', 'prefer': 'resolution=merge-duplicates,return=minimal'},
     )
-    urllib.request.urlopen(req, timeout=60)
+    supa(req)
 
 
 def lane_of(vid, lanes):
@@ -225,4 +251,9 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except SupabaseDown as e:
+        # 75 (a temporary failure): lessons.yml gives the lesson its try back
+        print(f'::error::Supabase did not answer after five tries: {e}')
+        sys.exit(75)
